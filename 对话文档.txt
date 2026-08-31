@@ -1,0 +1,1342 @@
+# 分析控制代码架构
+
+> 先分析这个代码的架构和使用方法，我需要理解其中的控制逻辑以方便后续其他研究
+
+<details><summary>5 previous messages</summary>
+
+> 我会先梳理仓库结构，再沿着 `MPC_fixed/main.py → master_controller.py → mpc_controller.py` 的调用链阅读控制路径，同时检查各执行器、传感器、配置和 README，最后整理成“架构、数据流、控制逻辑、启动方法、风险与后续研究入口”的中文说明。整个过程只读，不会运行串口下发或实机控制。
+>
+> 初步结果显示：仓库把“当前主程序”和“早期独立调试脚本”明确分开，主路径是 `MPC_fixed`。需要特别注意的是，部分注释与当前默认值存在历史残留（例如周期注释），所以我会以实际源码执行路径和参数为准，并把“源码事实”和“需要实机确认的假设”分开说明。
+>
+> 控制主链路已经基本确认：GUI 主线程负责调度，反馈线程负责周期读取，传感器自身还有独立接收线程；MPC 只输出四个“系统级角速度”，真正的 rpm 换算和串口协议都在执行器模块中完成。接下来我会补齐各模块的协议/状态细节，并检查启动前提、停止行为和源码中的历史残留，避免把说明文档误当成实际行为。
+>
+> 目前已经能把“使用方式”分成三层：先在 `IDLE` 下连接/读反馈/低速验证，再选择“本地调平”或“MPC 总控”；其中“停止控制循环”和“全部停止/急停”不是同一个动作，后者才会向各执行器发送停止命令。接下来只做不接硬件的语法编译和 MPC 自检，验证软件主路径是否能离线工作。
+>
+> 离线验证暂未执行起来：仓库里的 `.venv` 是从另一台/另一用户环境创建的，解释器仍指向不存在的 `C:\Users\Lenovo\...Python312\python.exe`。我会再检查当前机器是否有可用的系统 Python；如果有，只用它做同样的无硬件验证，不安装依赖、不触碰串口。
+</details>
+
+已完成源码级分析。当前主程序以 `MPC_fixed` 为准，根目录中文脚本属于早期独立调试程序。
+
+## 1. 总体架构
+
+```mermaid
+flowchart TD
+    A["main.py<br/>Tkinter入口"] --> B["MasterControlApp<br/>总控与模式管理"]
+    C["倾角传感器线程"] --> B
+    B --> D["TargetTrajectory<br/>目标轨迹"]
+    B --> E["MPCController<br/>QP求解器"]
+    E --> F["四个系统级角速度"]
+    F --> G["LevelingExecutor<br/>四腿调平"]
+    F --> H["AzimuthExecutor<br/>方位轴"]
+    F --> I["LiftExecutor<br/>举升/俯仰"]
+    B --> J["反馈轮询线程"]
+    J --> K["CSV实验记录"]
+```
+
+核心文件：
+
+| 文件 | 作用 |
+|---|---|
+| [`main.py`](<./MPC_fixed/main.py:7>) | 创建 GUI 并进入 Tkinter 主循环 |
+| [`master_controller.py`](<./MPC_fixed/master_controller.py:25>) | 总控、模式切换、反馈、MPC调度、命令分发、停止和日志 |
+| [`mpc_controller.py`](<./MPC_fixed/mpc_controller.py:42>) | MPC二次规划求解，不直接操作串口 |
+| [`target_trajectory.py`](<./MPC_fixed/target_trajectory.py:5>) | 生成未来3步目标方向向量 |
+| [`leveling_executor.py`](<./MPC_fixed/leveling_executor.py:24>) | 四条调平腿速度分配和协议发送 |
+| [`azimuth_executor.py`](<./MPC_fixed/azimuth_executor.py:32>) | 方位轴CiA402速度模式和编码器反馈 |
+| [`lift_executor.py`](<./MPC_fixed/lift_executor.py:38>) | 举升电缸、俯仰角编码器、前馈+PID |
+| [`tilt_sensor.py`](<./MPC_fixed/tilt_sensor.py:14>) | 倾角传感器接收、解析和滤波 |
+| [`common.py`](<./MPC_fixed/common.py:9>) | CRC、Modbus读取、编码器累计和单位换算 |
+
+## 2. 三种运行模式
+
+### `IDLE`
+
+用于：
+
+- 连接和断开设备；
+- 启动反馈轮询；
+- 手动调试四条调平腿；
+- 方位轴故障复位、使能、失能、低速运行；
+- 举升电缸手动运行；
+- 角度和位置置零。
+
+手动调试必须处于 `IDLE`，避免和自动控制循环同时发送命令。
+
+### `LOCAL_LEVELING`
+
+入口是 `启动本地调平阶段`。
+
+要求：
+
+- 倾角传感器已连接；
+- 四条调平腿全部连接。
+
+控制逻辑：
+
+1. 读取当前 X/Y 倾角；
+2. 计算角度误差；
+3. 根据车体长宽换算四腿速度；
+4. 叠加四腿扭转误差修正；
+5. 以某一条“最高腿”为参考腿；
+6. 进入死区后保持约5秒；
+7. 完成后自动停止。
+
+默认参数：
+
+- 死区：`0.002 deg`
+- `Kp = 0.2`
+- 抗扭增益：`0.01`
+- 最大调平电机速度：`150 rpm`
+- 保持时间：`5 s`
+
+此阶段不包含早期脚本中的触地和预顶升流程。
+
+### `MPC`
+
+启动时会：
+
+1. 强制要求选择 CSV 记录文件；
+2. 启动反馈轮询；
+3. 重置 MPC 内部速度记忆；
+4. 将当前传感器 Z 角作为 MPC 的相对零点；
+5. 周期生成目标轨迹；
+6. 求解 MPC；
+7. 把系统级角速度分发到三个执行系统。
+
+注意：源码的 `start_mpc_control()` 没有强制检查所有硬件是否连接，未连接的执行器只会被跳过。因此实际使用时必须自行确认连接和反馈正常。
+
+## 3. MPC控制逻辑
+
+MPC内部状态不是直接使用五个角度，而是先构造阵面方向向量：
+
+```text
+S = [0, 0, -1]
+当前方向 = Magzᵀ · Magxᵀ · Magyᵀ · Mbᵀ · Maᵀ · S
+```
+
+MPC参数：
+
+- 状态维度：`Nx = 3`，即 `[Rx, Ry, Rz]`
+- 控制维度：`Nu = 4`
+- 预测步长：`Np = 3`
+- 控制步长：`Nc = 2`
+- 实际采样周期：`T = 0.20 s`
+
+控制量顺序：
+
+```text
+U[0]：调平 X 轴角速度，rad/s
+U[1]：调平 Y 轴角速度，rad/s
+U[2]：方位角速度，rad/s，正值为逆时针
+U[3]：举升/俯仰角速度，rad/s
+```
+
+MPC求解的是控制增量：
+
+```text
+ΔU = [未来控制量相对当前 U 的变化]
+U_new = U_old + ΔU_first_step
+```
+
+目标函数主要包含：
+
+- 方向向量跟踪误差；
+- 控制增量惩罚；
+- 调平 X/Y 通道的附加正则项。
+
+约束包括：
+
+- 四个系统级角速度限幅；
+- 当前角度和角度限位推导出的动态速度限幅；
+- 每次控制增量限幅；
+- NaN/无穷值保护。
+
+求解器使用 OSQP。
+
+当前速度上限约为：
+
+| 通道 | 上限 |
+|---|---:|
+| 调平X | `0.04745 deg/s` |
+| 调平Y | `0.0611 deg/s` |
+| 方位 | `3.5 deg/s` |
+| 举升 | `3.9 deg/s` |
+
+## 4. 目标轨迹
+
+[`target_trajectory.py`](<./MPC_fixed/target_trajectory.py:26>) 默认执行：
+
+1. 俯仰角从当前目标逐渐升到 `60 deg`；
+2. 俯仰阶段约持续 `20 s`；
+3. 之后开始方位运动；
+4. 方位最大角速度为 `3.0 deg/s`；
+5. 俯仰最大角速度为 `3.4 deg/s`；
+6. 加速段时间均为 `2 s`。
+
+目标轨迹最终不是输出角度，而是转换成未来3步的方向向量：
+
+```text
+[Rx1,Ry1,Rz1, Rx2,Ry2,Rz2, Rx3,Ry3,Rz3]
+```
+
+实际总控调用时使用 `MPCController.T = 0.20 s` 作为预测间隔。
+
+## 5. 执行器映射
+
+### 调平
+
+系统级角速度先换算为四腿线速度：
+
+```text
+v_pitch = 0.5 × 车长 × X角速度
+v_roll  = 0.5 × 车宽 × Y角速度
+```
+
+四腿分配：
+
+```text
+leg0 =  pitch - roll
+leg1 =  pitch + roll
+leg2 = -pitch + roll
+leg3 = -pitch - roll
+```
+
+之后按照丝杠导程 `5 mm`、减速比 `5` 换算为电机 rpm，最后限制到 `±150 rpm`。
+
+腿编号和正负方向必须通过低速实机确认。
+
+### 方位
+
+方位角速度换算：
+
+```text
+rpm = rad/s × 60 / (2π) × motor_gear_ratio
+```
+
+当前：
+
+```text
+motor_gear_ratio = 1.0
+max_rpm = 1.0
+```
+
+方位正值定义为逆时针。
+
+方位轴使用 CiA402 风格控制字：
+
+- 速度模式；
+- 使能顺序 `0x0006 → 0x0007 → 0x000F`；
+- 目标速度使用 `0x60FF/F0DA`；
+- 实际位置使用 `0x6064/F010`；
+- 状态字使用 `0x6041/F003`。
+
+### 举升/俯仰
+
+MPC输出 `lift_rate_rad_s` 后：
+
+1. 转换成 `deg/s`；
+2. 根据当前俯仰角查询前馈增益表；
+3. 计算前馈 rpm；
+4. 用俯仰角速度误差进行 PID 修正；
+5. 发送电动缸速度。
+
+默认：
+
+- 电动缸最大速度：`2200 rpm`
+- PID `Kp=50`
+- PID修正限幅：`50 rpm`
+- 角速度目标上限：`4 deg/s`
+- 角速度滤波系数：`0.5`
+- 控制发送周期：`0.15 s`
+
+俯仰角由独立编码器读取，支持软件置零和多圈累计。
+
+## 6. 保护和停止行为
+
+总控中已有以下保护：
+
+- 俯仰角低于 `40 deg` 时，实际方位速度强制为零；
+- 俯仰角达到 `69 deg` 时停止举升；
+- MPC连续3次求解失败时全部停止；
+- 上一次有效MPC命令超过 `1 s` 未更新时全部停止；
+- MPC异常或输出非有限值时，MPC内部输出归零；
+- `stop_all()` 会停止调平、方位和举升，举升停止命令重复发送3次。
+
+特别注意：
+
+- `停止控制循环` 只停止调度和日志，不自动向执行器发送零速；
+- 硬件停机应使用 `全部停止/急停`；
+- 当前 MPC 内部俯仰角上限是 `65 deg`，反馈线程安全停止阈值是 `69 deg`，两者不是同一个限制。
+
+## 7. 推荐使用流程
+
+1. 安装 Python 3.10+ 和依赖：
+
+   ```powershell
+   python -m venv .venv
+   .\.venv\Scripts\python.exe -m pip install -r .\MPC_fixed\requirements.txt
+   ```
+
+2. 启动：
+
+   ```powershell
+   .\.venv\Scripts\python.exe .\MPC_fixed\main.py
+   ```
+
+3. 点击“刷新所有端口”。
+
+4. 连接设备：
+
+   - 倾角传感器：默认 `230400`
+   - 四条调平腿：默认 `115200`
+   - 方位控制器：默认 `115200`
+   - 举升电缸：默认 `115200`
+   - 俯仰编码器：默认 `115200`
+
+5. 启动反馈轮询，确认角度、位置、速度和方位状态字刷新。
+
+6. 在 `IDLE` 下低速验证：
+
+   - 四腿编号和方向；
+   - 方位逆时针/顺时针；
+   - 举升上升/下降；
+   - 故障复位、使能、停止；
+   - 调平、方位、俯仰置零。
+
+7. 先运行本地调平，确认四腿动作正确。
+
+8. 再选择 CSV 文件并启动 MPC。
+
+9. 实验结束时点击“全部停止/急停”。
+
+## 8. 后续研究建议关注的位置
+
+- 研究MPC模型和权重：[`mpc_controller.py`](<./MPC_fixed/mpc_controller.py:319>)
+- 研究目标轨迹：[`target_trajectory.py`](<./MPC_fixed/target_trajectory.py:46>)
+- 研究四腿运动学映射：[`leveling_executor.py`](<./MPC_fixed/leveling_executor.py:116>)
+- 研究俯仰控制：[`lift_executor.py`](<./MPC_fixed/lift_executor.py:479>)
+- 研究总控时序和安全逻辑：[`master_controller.py`](<./MPC_fixed/master_controller.py:872>)
+- 参考已有说明：[`control_principle.md`](<./docs/control_principle.md:1>)、[`usage.md`](<./docs/usage.md:1>)
+
+当前发现的主要历史残留是：源码实际周期为 `200 ms / 0.20 s`，但部分注释仍写着 `100 ms / 0.1 s`。另外，当前 `.venv` 指向不存在的 Lenovo 用户目录，系统中也没有可用 Python，因此本次未能完成编译和 MPC 离线自检。未修改文件，也未提交或推送。
+
+> D:\MY PC\桌面\未处理完成的文件\ready for\控制代码\控制代码>.\.venv\Scripts\python.exe .\MPC_fixed\main.py
+> Traceback (most recent call last):
+>   File "D:\MY PC\桌面\未处理完成的文件\ready for\控制代码\控制代码\.venv\Lib\site-packages\numpy\_core\__init__.py", line 24, in <module>
+>     from . import multiarray
+>   File "D:\MY PC\桌面\未处理完成的文件\ready for\控制代码\控制代码\.venv\Lib\site-packages\numpy\_core\multiarray.py", line 11, in <module>
+>     from . import _multiarray_umath, overrides
+>   File "D:\MY PC\桌面\未处理完成的文件\ready for\控制代码\控制代码\.venv\Lib\site-packages\numpy\_core\overrides.py", line 6, in <module>
+>     from numpy._core._multiarray_umath import (
+>     ...<3 lines>...
+>     )
+> ModuleNotFoundError: No module named 'numpy._core._multiarray_umath'
+>
+> The above exception was the direct cause of the following exception:
+>
+> Traceback (most recent call last):
+>   File "D:\MY PC\桌面\未处理完成的文件\ready for\控制代码\控制代码\MPC_fixed\main.py", line 4, in <module>
+>     from master_controller import MasterControlApp
+>   File "D:\MY PC\桌面\未处理完成的文件\ready for\控制代码\控制代码\MPC_fixed\master_controller.py", line 20, in <module>
+>     from mpc_controller import MPCController
+>   File "D:\MY PC\桌面\未处理完成的文件\ready for\控制代码\控制代码\MPC_fixed\mpc_controller.py", line 27, in <module>
+>     import numpy as np
+>   File "D:\MY PC\桌面\未处理完成的文件\ready for\控制代码\控制代码\.venv\Lib\site-packages\numpy\__init__.py", line 122, in <module>
+>     from numpy.**config** import show_config
+>   File "D:\MY PC\桌面\未处理完成的文件\ready for\控制代码\控制代码\.venv\Lib\site-packages\numpy\__config__.py", line 4, in <module>
+>     from numpy._core._multiarray_umath import (
+>     ...<3 lines>...
+>     )
+>   File "D:\MY PC\桌面\未处理完成的文件\ready for\控制代码\控制代码\.venv\Lib\site-packages\numpy\_core\__init__.py", line 85, in <module>
+>     raise ImportError(msg) from exc
+> ImportError:
+>
+> IMPORTANT: PLEASE READ THIS FOR ADVICE ON HOW TO SOLVE THIS ISSUE!
+>
+> Importing the numpy C-extensions failed. This error can happen for
+> many reasons, often due to issues with your setup or how NumPy was
+> installed.
+> The following compiled module files exist, but seem incompatible
+> with with either python 'cpython-314' or the platform 'win32':
+>
+>   * _multiarray_umath.cp312-win_amd64.lib
+>   * _multiarray_umath.cp312-win_amd64.pyd
+>
+> We have compiled some common reasons and troubleshooting tips at:
+>
+>     https://numpy.org/devdocs/user/troubleshooting-importerror.html
+>
+> Please note and check the following:
+>
+>   * The Python version is: Python 3.14 from "D:\MY PC\桌面\未处理完成的文件\ready for\控制代码\控制代码\.venv\Scripts\python.exe"
+>   * The NumPy version is: "2.5.1"
+>
+> and make sure that they are the versions you expect.
+>
+> Please carefully study the information and documentation linked above.
+> This is unlikely to be a NumPy issue but will be caused by a bad install
+> or environment on your machine.
+>
+> Original error was: No module named 'numpy._core._multiarray_umath'
+
+<details><summary>3 previous messages</summary>
+
+> 这个报错不是控制代码本身导致的，而是 `.venv` 内的 Python 与 NumPy 二进制包版本不匹配：当前解释器是 Python 3.14，但 NumPy 的二进制文件是 `cp312`（Python 3.12）版本。我要先确认这个虚拟环境的解释器、pip 和依赖状态，再给出最小修复方案；不会运行主程序或连接串口。
+>
+> 诊断已确认：`.venv\pyvenv.cfg` 记录的是当前 Python 3.14.6，而 NumPy 目录里只有 `cp312-win_amd64.pyd`。也就是说，这是一个被不同 Python 版本混用过的虚拟环境；最小修复是强制在当前 Python 3.14 环境中重装依赖，而不是修改 `MPC_fixed` 源码。我再核对官方 NumPy 的对应处理建议，然后给你可直接复制的命令。
+>
+> <details><summary>Searched the web</summary>
+>
+> Searched the web for `site:numpy.org/doc stable troubleshooting ImportError C-extensions failed Python version binary incompatible NumPy`
+>
+> </details>
+</details>
+
+问题已定位：`.venv` 中混用了不同 Python 版本的 NumPy。
+
+- 当前解释器：Python `3.14`
+- 已安装 NumPy：`2.5.1`
+- 实际扩展文件：`_multiarray_umath.cp312-win_amd64.pyd`，属于 Python `3.12`
+
+因此不是控制代码问题，而是 NumPy 二进制扩展不兼容。NumPy 官方也建议检查 Python、NumPy 和平台版本是否匹配。[官方排查说明](https://numpy.org/doc/stable/user/troubleshooting-importerror.html)
+
+在项目根目录执行：
+
+```powershell
+$py = ".\.venv\Scripts\python.exe"
+
+& $py -m pip install --upgrade pip
+& $py -m pip uninstall -y numpy scipy osqp pyserial
+& $py -m pip install --no-cache-dir --only-binary=:all: -r ".\MPC_fixed\requirements.txt"
+```
+
+然后验证：
+
+```powershell
+& $py -c "import sys, numpy, scipy, osqp, serial; print(sys.version); print(numpy.__version__); print('依赖正常')"
+& $py -m compileall -f -q ".\MPC_fixed"
+& $py ".\MPC_fixed\mpc_controller.py"
+```
+
+验证通过后再启动：
+
+```powershell
+& $py ".\MPC_fixed\main.py"
+```
+
+不要修改 `MPC_fixed` 控制逻辑，也不要把 Python 3.12 的 `.pyd` 文件手动复制到当前环境。此次错误发生在程序导入阶段，尚未连接或下发任何硬件命令。
+
+> D:\MY PC\桌面\未处理完成的文件\ready for\控制代码\控制代码>$py = ".\.venv\Scripts\python.exe"
+> '$py' 不是内部或外部命令，也不是可运行的程序
+> 或批处理文件。
+>
+> D:\MY PC\桌面\未处理完成的文件\ready for\控制代码\控制代码>
+> D:\MY PC\桌面\未处理完成的文件\ready for\控制代码\控制代码>& $py -m pip install --upgrade pip
+> 此时不应有 &。
+> D:\MY PC\桌面\未处理完成的文件\ready for\控制代码\控制代码>& $py -m pip uninstall -y numpy scipy osqp pyserial
+> 此时不应有 &。
+> D:\MY PC\桌面\未处理完成的文件\ready for\控制代码\控制代码>& $py -m pip install --no-cache-dir --only-binary=:all: -r ".\MPC_fixed\requirements.txt"
+
+> D:\MY PC\桌面\未处理完成的文件\ready for\控制代码\控制代码>$py = ".\.venv\Scripts\python.exe"
+> '$py' 不是内部或外部命令，也不是可运行的程序
+> 或批处理文件。
+>
+> D:\MY PC\桌面\未处理完成的文件\ready for\控制代码\控制代码>
+> D:\MY PC\桌面\未处理完成的文件\ready for\控制代码\控制代码>& $py -m pip install --upgrade pip
+> 此时不应有 &。
+> D:\MY PC\桌面\未处理完成的文件\ready for\控制代码\控制代码>& $py -m pip uninstall -y numpy scipy osqp pyserial
+> 此时不应有 &。
+> D:\MY PC\桌面\未处理完成的文件\ready for\控制代码\控制代码>& $py -m pip install --no-cache-dir --only-binary=:all: -r ".\MPC_fixed\requirements.txt"
+
+你当前使用的是 Windows `CMD`，不是 PowerShell，所以 `$py` 和 `&` 都不能用。
+
+直接逐行复制执行：
+
+```cmd
+cd /d "D:\MY PC\桌面\未处理完成的文件\ready for\控制代码\控制代码"
+
+".venv\Scripts\python.exe" -m pip install --upgrade pip
+
+".venv\Scripts\python.exe" -m pip uninstall -y numpy scipy osqp pyserial
+
+".venv\Scripts\python.exe" -m pip install --no-cache-dir --only-binary=:all: -r "MPC_fixed\requirements.txt"
+
+".venv\Scripts\python.exe" -c "import sys,numpy,scipy,osqp,serial; print(sys.version); print(numpy.__version__); print('依赖正常')"
+
+".venv\Scripts\python.exe" -m compileall -f -q "MPC_fixed"
+
+".venv\Scripts\python.exe" "MPC_fixed\mpc_controller.py"
+```
+
+验证通过后启动 GUI：
+
+```cmd
+".venv\Scripts\python.exe" "MPC_fixed\main.py"
+```
+
+如果想使用变量，在 CMD 中应写成：
+
+```cmd
+set "PY=.venv\Scripts\python.exe"
+"%PY%" -m pip --version
+```
+
+不要使用：
+
+```powershell
+$py = ...
+& $py ...
+```
+
+那是 PowerShell 语法。
+
+> 现在让我能够在电脑上（无实物）使用这个代码，给我提供一个实现仿真复现的方案，达到的效果我先设定水平和竖直方向的倾角、期望指向的向量，之后开始我能同时看着调平，方位，俯仰三个坐标的实时变化，并最后收敛至指向位置
+
+> 现在让我能够在电脑上（无实物）使用这个代码，给我提供一个实现仿真复现的方案，达到的效果我先设定水平和竖直方向的倾角、期望指向的向量，之后开始我能同时看着调平，方位，俯仰三个坐标的实时变化，并最后收敛至指向位置
+
+<details><summary>4 previous messages</summary>
+
+> 我会新增一个完全离线的仿真入口，不复用任何串口连接或下发路径：你可输入初始水平/竖直倾角与目标向量，点击开始后实时看到调平、方位、俯仰角以及当前/目标指向向量，控制器驱动虚拟机构收敛。为把实时坐标展示做得清楚，我会使用 `visualize` 技能的交互式可视化指导，并保持真实硬件控制代码不变。
+>
+> <details><summary>Created 2 files, edited 2 files</summary>
+>
+> - Wrote `./MPC_fixed/README.md` (+10 -0)
+> - Wrote `./MPC_fixed/simulation.py` (+444 -0)
+> - Wrote `./README.md` (+8 -0)
+> - Wrote `./docs/simulation.md` (+37 -0)
+>
+> </details>
+>
+> 离线仿真入口和说明已经加入：它只使用 MPC 求解器和虚拟机构，完全不导入真实传感器/串口执行器。我正使用独立运行时做语法检查，并会尝试用一个非 GUI 的闭环小测试确认默认目标是否能收敛。
+>
+> 闭环自检已经通过：默认“初始调平 X=1.2°、Y=-0.8°、俯仰5° → 目标向量 `[0,0.866025,-0.5]`”在 120 秒仿真时间内收敛到 0° 指向误差；另一个带方位变化的目标（方位45°、俯仰50°）也收敛到 0°。现在做最后的完整语法检查和变更核对。
+</details>
+
+已新增独立无硬件仿真，可直接启动：
+
+```cmd
+".venv\Scripts\python.exe" "MPC_fixed\simulation.py"
+```
+
+使用时：
+
+1. 输入初始调平 X/Y 倾角、方位角、俯仰角。
+2. 输入目标向量 `[Rx, Ry, Rz]`，例如 `0, 0.866025, -0.5`。
+3. 点击“重置为设定值”。
+4. 点击“开始仿真”。
+
+界面会实时显示调平、方位、俯仰、MPC 输出、当前/目标指向向量、指向误差、二维向量投影和最近 30 秒角度曲线。
+
+新增文件：
+
+- [simulation.py](<./MPC_fixed/simulation.py>)
+- [simulation.md](<./docs/simulation.md>)
+
+同时更新了 [README.md](<./README.md>) 与 [MPC_fixed/README.md](<./MPC_fixed/README.md>)。
+
+仿真只复用 `MPCController`，不会导入串口执行器或下发硬件命令，因此不改变真实控制代码行为。虚拟机构使用一阶惯性模型，默认测试已收敛到 `0°` 指向误差；它验证的是控制链路与坐标关系，不替代真实机构的低速验证。
+
+已验证：
+
+- `.venv` 已能导入 NumPy、SciPy、OSQP、pyserial；
+- `compileall MPC_fixed` 通过；
+- 默认和带方位变化的闭环仿真均数值收敛。
+
+未提交、未推送。
+
+> 我现在要参考这个代码对实物样机进行举升缸（俯仰角度）的调试，大致计划包括
+> 1.接线恢复、数据通过串口转USB接入电脑；
+> 2.查看俯仰编码器、电机编码器输出是否正常
+> 3.驱动举升电动缸、记录是否能正常工作
+> 4.记录举升电动缸最大行程
+> 5.不同速度指令驱动，记录举升速度
+> 6.最小进给量驱动、记录俯仰编码器读书变化
+> 7.*给定举升角度，驱动举升电动缸验证是否能够到位（开环），记录误差
+> 给我制作一个完整方案和测试程序与程序使用说明，先制定计划
+
+<details><summary>1 previous message</summary>
+
+> 这项工作会直接驱动实物举升缸，我会按“先只读反馈、再极低速点动、再标定、最后开环到位”的顺序规划；在你确认计划前，不修改控制代码，也不执行任何串口下发。
+</details>
+
+计划如下。确认后我会先实现独立测试程序，不改 MPC、总控或真实运行入口。
+
+## 实施边界
+
+新增一个“举升缸/俯仰测试台”程序：
+
+- 复用现有 `LiftExecutor`、电动缸 `0x3308` 速度帧、举升编码器 `0x4202`、俯仰编码器 `0xF010`；
+- 不接入 MPC、不调用总控自动循环；
+- 所有动作均为实验人员手动触发，默认低速、短脉冲、自动停止；
+- 每次动作和全部反馈写入 CSV，校准结果单独保存；
+- GUI 关闭、异常、急停时重复发送举升零速。
+
+## 分阶段测试计划
+
+| 阶段 | 内容 | 通过条件 |
+|---|---|---|
+| 0 | 接线、机械限位、急停和串口识别 | 两个串口明确对应举升缸与俯仰编码器；急停可用 |
+| 1 | 只读反馈 | 俯仰编码器与电机编码器连续读数稳定、无明显跳变 |
+| 2 | 极低速点动 | 正/负方向与俯仰角变化方向确认；停止命令有效 |
+| 3 | 安全有效行程 | 人工记录两个安全端点，得到缸行程、俯仰范围和两者对应关系 |
+| 4 | 速度标定 | 多档 rpm、双方向、重复试验，记录缸线速度和俯仰角速度 |
+| 5 | 最小进给量 | 短脉冲低速驱动，测最小可分辨缸位移与俯仰角变化 |
+| 6 | 开环目标角验证 | 以标定得到的“角度→行程/时间”前馈，固定 rpm、固定时长运行；仅记录最终角度误差，不做在线修正 |
+
+阶段 3–6 前必须完成阶段 2；任一阶段发现方向异常、读数失真、停止失效或机械干涉，立即停止，不进入下一阶段。
+
+## 测试程序设计
+
+拟新增：
+
+- `MPC_fixed/lift_testbench.py`：独立 Tkinter 测试程序；
+- `MPC_fixed/lift_test_model.py`：不接硬件的纯计算模块，负责速度估计、标定点处理、开环时长计算；
+- `docs/lift_test_plan.md`：完整中文使用说明、接线记录表和实验记录模板。
+
+界面包含：
+
+- 举升缸和俯仰编码器 COM 口连接；
+- 原始计数、缸位移 mm、俯仰角、俯仰角速度、通信健康状态；
+- 软件置零；
+- 使能测试：默认 `20 rpm`、`0.5 s` 单次脉冲，可配置但有上限；
+- 正向/反向点动、立即停止、红色急停；
+- “开始/结束端点记录”与行程计算；
+- 多速度试验表：每档速度、持续时间、方向、重复次数；
+- 最小进给量脉冲试验；
+- 标定曲线：缸位移–俯仰角；
+- 开环目标角试验：输入目标角与固定 rpm，计算一次性运行时长，运行后记录最终误差；
+- CSV 日志与实验备注。
+
+CSV 会记录时间、阶段、动作编号、命令 rpm、指令持续时间、电机原始计数、缸位移、俯仰原始计数、俯仰角、角速度、急停/停止原因与人工备注。
+
+## 安全策略
+
+- 不提供自动连续扫行程；端点由实验人员低速接近并手动确认，避免撞机械硬限位。
+- 未获得两路有效反馈、反馈超时、端口断开时禁止发送运动命令。
+- 运动只能以短脉冲执行；每次结束自动发送零速。
+- 急停、关闭窗口、异常时发送三次零速。
+- 默认测试上限远低于现有 `LiftExecutor.max_motor_rpm = 2200`，不会沿用该最大值。
+- 开环到位阶段仍保留俯仰编码器记录，但不以它做实时修正；这样测得的才是开环误差。
+
+## 开环验证的定义
+
+严格开环不能直接“按角度停下”，因此流程是：
+
+```text
+标定点：俯仰角 ↔ 缸位移 / 固定 rpm 下所需时间
+        ↓
+输入目标角
+        ↓
+查表得到目标位移或运行时长
+        ↓
+固定速度单次运行后停止
+        ↓
+只读取最终俯仰角并计算误差
+```
+
+之后可额外提供“编码器位移辅助停止”模式，用于比较纯开环与行程反馈辅助的误差；两者会明确区分，避免把辅助模式误写成开环。
+
+实现前请确认以下假设是否正确：
+
+1. 举升缸仍使用现有 `0x3308` 速度协议和 `0x4202` 位置寄存器。
+2. 俯仰编码器仍使用 `0xF010` 位置寄存器。
+3. 先按默认低速 `20 rpm / 0.5 s` 脉冲作为首次点动上限。
+4. 试验时具备独立硬件急停、人员可观察机械运动、无载或安全载荷条件。
+
+你确认后，我会按此计划开始编写测试程序、离线自检和中文使用说明。
+
+> 最后写清楚具体操作，硬件与当前计算机连接的接口应该是usb，每一项测试的程序分别输出，不要写在一起，同时还要做一个可视化界面，我可以直接通过这个可视化界面来进行操作举升缸
+
+<details><summary>1 previous message</summary>
+
+> 收到。我会把方案改为 7 个彼此独立的可视化测试程序：每个窗口只允许执行本阶段的操作、只生成本阶段的 CSV，避免把行程、速度、最小进给和开环到位混在同一程序里。硬件通过 USB 转串口接入电脑，但程序会按 Windows 识别出的 COM 口连接两个设备。
+</details>
+
+已按你的要求调整为“USB 接入 + 每项独立可视化程序 + 独立输出”的方案。
+
+## 接口与接线约定
+
+电脑只通过 USB 与设备通信；Windows 会把 USB 转串口设备识别为 `COMx`，测试程序选择的是 COM 口，不是直接选择 USB。
+
+建议使用两路独立 USB 转串口：
+
+| 设备 | 电脑侧接口 | 程序中的连接 |
+|---|---|---|
+| 举升电动缸驱动器 | USB 转串口 / USB 转 RS485 | “举升缸 COM 口” |
+| 俯仰角度编码器 | USB 转串口 / USB 转 RS485 | “俯仰编码器 COM 口” |
+
+具体操作会写入每个程序的说明中：
+
+1. 设备断电后完成动力线、编码器线、通信线和急停连接。
+2. 接入 USB 转串口后，在“设备管理器 → 端口(COM 和 LPT)”记录两个 COM 号。
+3. 依次拔插 USB，确认哪个 COM 对应举升缸、哪个对应俯仰编码器。
+4. 先只启动“反馈检查”程序，确认读取正常，绝不先点动。
+5. 急停必须独立于 USB 和软件；USB 仅作为通信链路，不能充当安全停机措施。
+
+## 将生成的独立程序
+
+每个程序都是单独 GUI、单独 CSV、单独操作流程，不会混合运行。
+
+| 编号 | 程序 | GUI 能做什么 | 输出 |
+|---|---|---|---|
+| 00 | `lift_00_usb_connection_check.py` | 刷新 COM、连接测试、显示端口描述与通信状态 | `00_connection_*.csv` |
+| 01 | `lift_01_encoder_feedback_check.py` | 只读取电机编码器和俯仰编码器，显示原始计数、位移、角度、刷新率 | `01_feedback_*.csv` |
+| 02 | `lift_02_low_speed_jog.py` | 低速正/反向短脉冲、停止、急停，确认方向与停止效果 | `02_jog_*.csv` |
+| 03 | `lift_03_safe_stroke_measure.py` | 人工记录两个安全端点，计算可用缸行程和俯仰范围 | `03_stroke_*.csv` |
+| 04 | `lift_04_speed_characterization.py` | 逐个执行指定 rpm、方向、时长的速度试验 | `04_speed_*.csv` |
+| 05 | `lift_05_min_increment.py` | 极低速短脉冲，测最小缸位移与最小俯仰角变化 | `05_increment_*.csv` |
+| 06 | `lift_06_open_loop_angle.py` | 输入目标俯仰角，以标定前馈计算固定 rpm 与时长后单次运行，记录最终误差 | `06_open_loop_*.csv` |
+
+内部会共用一个安全通信模块，但不会提供“一键执行全部试验”或把所有动作放在同一个窗口。
+
+## 每个 GUI 的共同安全设计
+
+- 必须先连接、读取到有效且未超时的两路反馈，才允许运动。
+- 有清晰的“允许低速运动”解锁步骤。
+- 默认低速、短脉冲；一次指令结束后自动发送零速。
+- 红色“立即停止”按钮、关闭窗口、串口异常、反馈超时都会连续发送零速。
+- 每一项动作记录时间、阶段、命令 rpm、持续时间、缸位移、俯仰角、俯仰角速度、原始计数、停止原因和备注。
+- 默认不允许自动撞击机械端点。
+
+特别是“最大行程”测试，程序记录的是实验人员确认的两个安全端点之间的可用行程，不会自动驱动到硬机械限位。
+
+## 实物操作顺序
+
+1. 运行 `00`，确认两个 USB 串口的 COM 映射。
+2. 运行 `01`，观察静止读数至少 30 秒；手动缓慢移动机构时，确认电机编码器和俯仰编码器都有对应变化。
+3. 运行 `02`，从最低 rpm、最短脉冲开始；记录“正 rpm 对应俯仰角增大还是减小”。若方向相反，停止后修正测试配置，不直接修改 MPC。
+4. 运行 `03`，低速接近下端和上端安全位置，人工按“记录端点”；得到可用行程、俯仰角范围和标定原始数据。
+5. 运行 `04`，每个速度、每个方向至少重复 3 次，得到 rpm—缸速度—俯仰角速度数据。
+6. 运行 `05`，逐步缩短脉冲或降低 rpm，记录能稳定分辨的最小位移和最小角度变化。
+7. 运行 `06`，基于阶段 03–05 的标定输入目标角；程序执行一次严格开环运动，之后只读取最终角度并记录误差。
+
+阶段 06 会区分两种模式：
+
+- 严格开环：固定 rpm、固定时长，不依据俯仰反馈中途修正；
+- 行程反馈辅助：按电机编码器位移停止，用来比较实际可达到的误差，但不称为严格开环。
+
+## 最终文档
+
+会新增一份中文总说明，逐项写清楚：
+
+- USB/COM 接线与识别；
+- CMD 启动命令；
+- 每个 GUI 的按钮含义；
+- 每一步前提、操作、应观察的现象；
+- CSV 字段说明；
+- 通过/失败判定；
+- 异常时如何停止；
+- 实机需要确认的方向、传动关系、最大行程和安全边界。
+
+请确认这个“7 个独立 GUI 程序”的拆分方式。我确认后就开始实现，且保持现有 `master_controller.py`、MPC 和正常硬件运行入口不变。
+
+> 开始执行
+
+<details><summary>5 previous messages</summary>
+
+> 我将实现为独立的 `lift_00` 至 `lift_06` 七个入口文件，并用一个仅供它们复用的安全通信层处理 COM 连接、反馈、短脉冲、急停和日志。真实控制模块不改；所有运动命令只会从你在对应 GUI 中主动触发的按钮发出。
+>
+> <details><summary>Created 8 files</summary>
+>
+> - Wrote `./MPC_fixed/lift_00_usb_connection_check.py` (+6 -0)
+> - Wrote `./MPC_fixed/lift_01_encoder_feedback_check.py` (+6 -0)
+> - Wrote `./MPC_fixed/lift_02_low_speed_jog.py` (+6 -0)
+> - Wrote `./MPC_fixed/lift_03_safe_stroke_measure.py` (+6 -0)
+> - Wrote `./MPC_fixed/lift_04_speed_characterization.py` (+6 -0)
+> - Wrote `./MPC_fixed/lift_05_min_increment.py` (+6 -0)
+> - Wrote `./MPC_fixed/lift_06_open_loop_angle.py` (+6 -0)
+> - Wrote `./MPC_fixed/lift_test_common.py` (+901 -0)
+>
+> </details>
+>
+> 七个独立入口及其公共安全层已完成，且离线语法检查通过。当前实现把测试实例速度硬限制为 `100 rpm`、单次脉冲限制为 `2 s`；它不会改动主程序中举升缸的 `2200 rpm` 默认值。接下来我会补充逐项 USB/COM 接线、启动、操作和数据判定说明。
+>
+> <details><summary>Created a file, edited 3 files</summary>
+>
+> - Wrote `./MPC_fixed/README.md` (+4 -0)
+> - Wrote `./README.md` (+4 -0)
+> - Wrote `./docs/lift_testbench.md` (+216 -0)
+> - Wrote `./MPC_fixed/lift_test_common.py` (+1 -3)
+>
+> </details>
+>
+> 实现和离线检查均已完成：七个入口都通过语法编译，安全默认值也已核验。由于此环境没有接入实物，我没有打开任何测试窗口、没有连接 COM 口、也没有发送任何运动命令；实机第一步应严格从只读的 `lift_00`、`lift_01` 开始。
+</details>
+
+已完成 7 个独立的可视化实机测试程序。它们不会进入 MPC 或总控循环；只有在对应 GUI 中连接 USB/COM、开启 CSV、勾选安全确认并点击动作按钮时，才会向举升缸发送命令。
+
+从 `00` 开始逐项运行：
+
+```cmd
+".venv\Scripts\python.exe" "MPC_fixed\lift_00_usb_connection_check.py"
+".venv\Scripts\python.exe" "MPC_fixed\lift_01_encoder_feedback_check.py"
+".venv\Scripts\python.exe" "MPC_fixed\lift_02_low_speed_jog.py"
+".venv\Scripts\python.exe" "MPC_fixed\lift_03_safe_stroke_measure.py"
+".venv\Scripts\python.exe" "MPC_fixed\lift_04_speed_characterization.py"
+".venv\Scripts\python.exe" "MPC_fixed\lift_05_min_increment.py"
+".venv\Scripts\python.exe" "MPC_fixed\lift_06_open_loop_angle.py"
+```
+
+新增内容：
+
+- [公共安全通信层](<./MPC_fixed/lift_test_common.py>)
+- [00 USB/COM 识别](<./MPC_fixed/lift_00_usb_connection_check.py>)
+- [01 编码器反馈检查](<./MPC_fixed/lift_01_encoder_feedback_check.py>)
+- [02 低速点动](<./MPC_fixed/lift_02_low_speed_jog.py>)
+- [03 安全行程测量](<./MPC_fixed/lift_03_safe_stroke_measure.py>)
+- [04 速度特性](<./MPC_fixed/lift_04_speed_characterization.py>)
+- [05 最小进给](<./MPC_fixed/lift_05_min_increment.py>)
+- [06 开环目标角](<./MPC_fixed/lift_06_open_loop_angle.py>)
+- [完整 USB 接线与逐项操作说明](<./docs/lift_testbench.md>)
+
+每个程序有独立 GUI 和独立 CSV。`03` 会导出端点标定 JSON，`04` 会导出速度结果 JSON，供 `06` 加载并进行严格开环角度误差试验。
+
+安全限制：
+
+- 测试实例最大速度固定为 `100 rpm`；
+- 默认 `20 rpm`、`0.5 s`；
+- 单次运动脉冲不超过 `2 s`；
+- 必须有两路有效反馈、CSV 记录和手动安全确认才能动作；
+- 急停、异常和窗口关闭会连续发送三次零速；
+- 不会自动撞击机械硬限位。
+
+已完成 `compileall MPC_fixed` 和离线安全默认值检查。未进行任何 COM 连接、串口写入或实机动作验证；首次实机请只运行 `00` 和 `01`，再以 `5 rpm / 0.2 s` 开始 `02` 的方向确认。
+
+未提交、未推送。
+
+> 给我一步一步的操作指令
+
+下面按顺序操作。首次实物测试请只完成 `00 → 01 → 02`，确认无误后再继续后面的行程、速度和开环试验。
+
+## 0. 上电前准备
+
+1. 举升缸处于安全中间位置，活动区域内无人、无干涉物。
+2. 确认独立硬件急停可用；不要把 USB 拔插当作急停。
+3. 设备断电时完成：
+   - 举升缸驱动器通信线 → USB 转串口/RS485 → 电脑；
+   - 俯仰编码器通信线 → 另一条 USB 转串口/RS485 → 电脑。
+4. 接通控制电源和 USB。
+5. 打开 Windows“设备管理器 → 端口(COM 和 LPT)”，确认出现两个 COM 口。
+
+打开 CMD，进入项目目录：
+
+```cmd
+cd /d "D:\MY PC\桌面\未处理完成的文件\ready for\控制代码\控制代码"
+```
+
+---
+
+## 1. 识别 USB 与 COM 口：`00`
+
+启动：
+
+```cmd
+".venv\Scripts\python.exe" "MPC_fixed\lift_00_usb_connection_check.py"
+```
+
+操作：
+
+1. 点击“刷新 COM 口”。
+2. 记录界面显示的 COM 号与设备描述。
+3. 拔掉“举升缸”的 USB 转串口，点击刷新，确认消失的是哪个 COM。
+4. 插回后，再拔掉“俯仰编码器”的 USB 转串口，确认其 COM。
+5. 在界面选择：
+   - “举升缸 COM”：举升驱动器对应端口；
+   - “俯仰编码器 COM”：编码器对应端口。
+6. 分别点击“连接/断开举升缸”和“连接/断开俯仰编码器”。
+
+此程序只读反馈，不会发送运动命令。连接无异常后关闭窗口。
+
+---
+
+## 2. 检查两个编码器读数：`01`
+
+启动：
+
+```cmd
+".venv\Scripts\python.exe" "MPC_fixed\lift_01_encoder_feedback_check.py"
+```
+
+操作：
+
+1. 刷新 COM 口，选择和 `00` 相同的两个端口。
+2. 连接举升缸、连接俯仰编码器。
+3. 查看“通信状态”，必须显示：
+
+   ```text
+   电机反馈：有效；俯仰反馈：有效
+   ```
+
+4. 点击“开始本阶段 CSV”，选择保存位置，例如：
+
+   ```text
+   01_feedback_20260817.csv
+   ```
+
+5. 让机构静止，点击“开始 30 s 稳定性记录”。
+6. 等待 30 秒，记录界面给出的：
+   - 电机位移峰峰值；
+   - 俯仰角峰峰值；
+   - 是否有读数中断或跳变。
+
+不要继续下一步，除非两路反馈连续有效、静止时无明显异常跳变。
+
+---
+
+## 3. 最低速点动、确认方向：`02`
+
+启动：
+
+```cmd
+".venv\Scripts\python.exe" "MPC_fixed\lift_02_low_speed_jog.py"
+```
+
+操作：
+
+1. 连接两个 COM，确认两路反馈有效。
+2. 点击“开始本阶段 CSV”。
+3. 勾选：
+
+   ```text
+   我已确认机械活动区域、载荷、独立急停和人员站位安全
+   ```
+
+4. 首次输入：
+
+   ```text
+   速度：5 rpm
+   脉冲时长：0.20 s
+   ```
+
+5. 点击“发送正 rpm 脉冲”。
+6. 等机构完全停止，观察并记录：
+   - 缸位移是正还是负；
+   - 俯仰角是增大还是减小；
+   - 指令结束后是否立即停止。
+7. 再点击“发送负 rpm 脉冲”，记录相反方向。
+
+此时只记录“正 rpm / 负 rpm”的真实效果，暂时不要把它直接理解为上升或下降。若方向、读数、停止行为任一异常，点击红色“立即停止 / 急停”，不要继续。
+
+---
+
+## 4. 记录安全可用行程：`03`
+
+启动：
+
+```cmd
+".venv\Scripts\python.exe" "MPC_fixed\lift_03_safe_stroke_measure.py"
+```
+
+操作：
+
+1. 将机构放在你定义的安全起始位置。
+2. 如需要，把当前位置定义为参考零点：
+   - 点击“电机位移清零”；
+   - 点击“俯仰角清零”。
+3. 开始 CSV，勾选安全确认。
+4. 使用低速短脉冲，缓慢接近第一个安全端点；不要撞机械硬限位。
+5. 留出安全余量，停止并等待读数稳定。
+6. 点击“记录安全端点 A”。
+7. 用短脉冲移动到另一侧安全端点，同样保留余量。
+8. 停止、稳定后点击“记录安全端点 B”。
+9. 查看界面显示的：
+   - 安全可用行程 mm；
+   - 俯仰范围 °；
+   - B-A 的位移与角度方向关系。
+10. 点击“导出端点标定 JSON”，保存为：
+
+   ```text
+   03_stroke_endpoints.json
+   ```
+
+不要把这个值当作硬机械极限，它只是你人工确认的安全可用范围。
+
+---
+
+## 5. 测试不同 rpm 的速度：`04`
+
+启动：
+
+```cmd
+".venv\Scripts\python.exe" "MPC_fixed\lift_04_speed_characterization.py"
+```
+
+操作：
+
+1. 把机构停在行程中间位置，远离两个端点。
+2. 连接两个设备，开始 CSV，勾选安全确认。
+3. 从以下条件开始：
+
+   ```text
+   速度：5 rpm
+   脉冲时长：0.50 s
+   ```
+
+4. 点击“正方向速度试验”，记录平均缸线速度和平均俯仰角速度。
+5. 点击“负方向速度试验”，记录结果。
+6. 对每个方向至少重复 3 次。
+7. 依次增加速度，例如：
+
+   ```text
+   5 rpm → 10 rpm → 20 rpm → 40 rpm
+   ```
+
+   每升一级前确认前一级行为正常。
+8. 每次需要用于开环试验的数据，点击“导出最近速度结果 JSON”，建议按方向和 rpm 命名，例如：
+
+   ```text
+   04_speed_10rpm_positive.json
+   ```
+
+开环试验时，要使用与目标运动方向、载荷和起始姿态尽量一致的速度数据。
+
+---
+
+## 6. 测试最小进给量：`05`
+
+启动：
+
+```cmd
+".venv\Scripts\python.exe" "MPC_fixed\lift_05_min_increment.py"
+```
+
+操作：
+
+1. 机构置于中间安全位置。
+2. 连接设备，开始 CSV，勾选安全确认。
+3. 初始设置：
+
+   ```text
+   速度：5 rpm
+   脉冲时长：0.20 s
+   ```
+
+4. 点击“正方向最小进给”，等待完全停止。
+5. 记录界面显示：
+   - `Δ缸位移`；
+   - `Δ俯仰`。
+6. 点击“负方向最小进给”，同样记录。
+7. 每个条件重复至少 5 次。
+8. 逐步降低速度或缩短脉冲，例如：
+
+   ```text
+   5 rpm / 0.20 s
+   5 rpm / 0.10 s
+   2 rpm / 0.10 s
+   ```
+
+最小进给量应取“重复动作都能稳定测出、明显大于静止噪声”的最小值。
+
+---
+
+## 7. 开环目标俯仰角试验：`06`
+
+只有完成 `03` 和 `04` 后才执行。
+
+启动：
+
+```cmd
+".venv\Scripts\python.exe" "MPC_fixed\lift_06_open_loop_angle.py"
+```
+
+操作：
+
+1. 先恢复与 `03` 标定时相同的机械参考位置和电机零点。
+2. 连接设备，确认反馈有效。
+3. 点击“加载 03 端点标定 JSON”，选择：
+
+   ```text
+   03_stroke_endpoints.json
+   ```
+
+4. 点击“加载 04 速度结果 JSON”，选择与本次运动方向相同的速度文件。
+5. 输入一个小范围目标俯仰角。目标必须在 A、B 两个安全端点之间。
+6. 点击“计算单次开环计划”。
+7. 核对显示的：
+   - 目标位移；
+   - 当前位移；
+   - rpm 正负方向；
+   - 固定运行时长。
+8. 首次只允许运行时间不超过 `2 s`；超过时程序会拒绝。
+9. 开始 CSV，勾选安全确认。
+10. 点击“执行一次开环脉冲”。
+11. 等待停止，记录：
+
+   ```text
+   开环误差 = 最终俯仰角 - 目标俯仰角
+   ```
+
+该测试中，俯仰编码器只用于开始前确认和结束后计算误差，运动过程中不会按俯仰角自动修正，因此才是开环试验。
+
+完整说明见 [lift_testbench.md](<./docs/lift_testbench.md>)。
+
+> 给我使用剩下的额度总结一下对话内容，我需要将项目所有代码到另一台设备上去进行实验
+
+下面是可直接带到另一台设备的项目交接摘要。
+
+## 1. 复制项目
+
+当前代码有未提交的新文件，不能只靠 Git 拉取。请直接复制整个项目目录，包括：
+
+```text
+D:\MY PC\桌面\未处理完成的文件\ready for\控制代码\控制代码
+```
+
+必须带走：
+
+- `MPC_fixed/`
+- `docs/`
+- `specs/`
+- `README.md`
+- `MPC_fixed/README.md`
+- `AGENTS.md`
+
+不要复制：
+
+- `.venv/`：虚拟环境与当前电脑、Python 版本绑定；
+- `__pycache__/`
+- 实验生成的 CSV、JSON、日志。
+
+在 CMD 可用：
+
+```cmd
+robocopy "D:\MY PC\桌面\未处理完成的文件\ready for\控制代码\控制代码" "目标设备上的项目目录\控制代码" /E /XD .venv __pycache__ .vscode /XF *.csv *.log
+```
+
+如果要保留 Git 历史，复制时不要排除 `.git`。
+
+## 2. 新电脑的软件环境
+
+当前已验证环境：
+
+```text
+Python 3.14.6（64 位）
+numpy 2.5.2
+scipy 1.18.0
+osqp 1.1.3
+pyserial 3.5
+```
+
+在新电脑安装 Python 3.14 64 位后，在项目根目录执行：
+
+```cmd
+py -3.14 -m venv .venv
+".venv\Scripts\python.exe" -m pip install --upgrade pip
+".venv\Scripts\python.exe" -m pip install --no-cache-dir --only-binary=:all: -r "MPC_fixed\requirements.txt"
+```
+
+验证环境：
+
+```cmd
+".venv\Scripts\python.exe" -c "import numpy,scipy,osqp,serial; print(numpy.__version__); print(scipy.__version__); print(osqp.__version__); print(serial.VERSION)"
+".venv\Scripts\python.exe" -m compileall -f -q "MPC_fixed"
+".venv\Scripts\python.exe" "MPC_fixed\mpc_controller.py"
+```
+
+此前曾出现 NumPy `cp312` 与 Python 3.14 混用问题。新电脑务必重新创建 `.venv`，不要复制旧 `.venv`。
+
+## 3. 原项目架构
+
+真实总控主路径：
+
+```text
+MPC_fixed/main.py
+  └─ master_controller.py
+       ├─ tilt_sensor.py
+       ├─ leveling_executor.py
+       ├─ azimuth_executor.py
+       ├─ lift_executor.py
+       ├─ target_trajectory.py
+       └─ mpc_controller.py
+```
+
+主要模块：
+
+- `main.py`：Tkinter 主程序入口。
+- `master_controller.py`：GUI、串口连接、反馈轮询、模式切换、MPC 调度、CSV、停止逻辑。
+- `mpc_controller.py`：OSQP MPC；输出系统级角速度，不直接写串口。
+- `leveling_executor.py`：调平 X/Y 角速度映射为四腿 rpm。
+- `azimuth_executor.py`：方位轴 CiA402 速度模式。
+- `lift_executor.py`：举升缸速度、俯仰编码器、多圈角度、前馈+PID。
+- `tilt_sensor.py`：倾角传感器串口帧解析。
+- `common.py`：CRC、Modbus、编码器累计、单位转换。
+
+MPC 四通道输出：
+
+```text
+leveling_x_rate_rad_s
+leveling_y_rate_rad_s
+azimuth_rate_rad_s
+lift_rate_rad_s
+```
+
+当前默认周期为：
+
+```text
+控制周期：200 ms
+反馈周期：200 ms
+MPC 周期：200 ms
+MPC 内部 T：0.20 s
+Np：3
+Nc：2
+```
+
+部分旧注释仍写 `100 ms / 0.1 s`，以源码当前数值 `200 ms / 0.20 s` 为准。
+
+## 4. 不接硬件的 MPC 仿真
+
+新增的无硬件仿真入口：
+
+```cmd
+".venv\Scripts\python.exe" "MPC_fixed\simulation.py"
+```
+
+文件：
+
+- `MPC_fixed/simulation.py`
+- `docs/simulation.md`
+
+功能：
+
+- 输入初始调平 X/Y 倾角、方位角、俯仰角；
+- 输入目标方向向量 `[Rx, Ry, Rz]`；
+- 实时显示调平、方位、俯仰、MPC 输出、当前向量、目标向量、指向误差和曲线；
+- 不创建串口，不向硬件发送命令。
+
+默认仿真已数值验证收敛。虚拟机构为一阶惯性模型，不代表真实摩擦、负载、间隙或传动误差。
+
+## 5. 新增的举升缸实机测试套件
+
+测试程序彼此独立；不要同时打开多个测试 GUI。
+
+```text
+MPC_fixed/lift_00_usb_connection_check.py
+MPC_fixed/lift_01_encoder_feedback_check.py
+MPC_fixed/lift_02_low_speed_jog.py
+MPC_fixed/lift_03_safe_stroke_measure.py
+MPC_fixed/lift_04_speed_characterization.py
+MPC_fixed/lift_05_min_increment.py
+MPC_fixed/lift_06_open_loop_angle.py
+MPC_fixed/lift_test_common.py
+docs/lift_testbench.md
+```
+
+共同安全限制：
+
+```text
+测试实例最大速度：100 rpm
+默认速度：20 rpm
+默认单脉冲：0.5 s
+单脉冲硬上限：2.0 s
+```
+
+这些限制只作用于新测试程序实例，不修改原 `LiftExecutor.max_motor_rpm = 2200` 的主程序默认行为。
+
+启动顺序：
+
+```cmd
+".venv\Scripts\python.exe" "MPC_fixed\lift_00_usb_connection_check.py"
+".venv\Scripts\python.exe" "MPC_fixed\lift_01_encoder_feedback_check.py"
+".venv\Scripts\python.exe" "MPC_fixed\lift_02_low_speed_jog.py"
+".venv\Scripts\python.exe" "MPC_fixed\lift_03_safe_stroke_measure.py"
+".venv\Scripts\python.exe" "MPC_fixed\lift_04_speed_characterization.py"
+".venv\Scripts\python.exe" "MPC_fixed\lift_05_min_increment.py"
+".venv\Scripts\python.exe" "MPC_fixed\lift_06_open_loop_angle.py"
+```
+
+必须按 `00 → 01 → 02 → 03 → 04 → 05 → 06` 的顺序，不要跳过前置确认。
+
+## 6. 实物通信假设
+
+新测试套件依据当前源码，假设有两条独立 USB 转串口链路：
+
+```text
+举升缸驱动器 → USB 转串口 / USB 转 RS485 → 电脑 COM 口
+俯仰编码器   → USB 转串口 / USB 转 RS485 → 电脑另一 COM 口
+```
+
+默认波特率均为：
+
+```text
+115200
+```
+
+协议假设：
+
+```text
+举升缸速度命令：0x3308
+举升缸电机编码器：0x4202
+俯仰编码器位置：0xF010
+丝杠导程：5 mm
+减速比：5:1
+```
+
+这些是源码事实，不是新设备已验证事实。新样机必须先做 `00`、`01`，确认 COM 映射和反馈正常。
+
+## 7. 实机操作最重要的安全规则
+
+- USB 是通信通道，不是急停。
+- 独立硬件急停必须先确认可用。
+- 第一次点动从 `5 rpm / 0.2 s` 开始。
+- 未确认前，“正 rpm / 负 rpm”仅表示命令符号，不要假定其等于上升、下降。
+- 行程测试记录的是人工确认的安全可用行程，不允许程序自动撞击机械硬限位。
+- 速度、最小进给、开环目标角试验都在中间安全位置开始。
+- 每次动作前都需要两路有效反馈、开启 CSV、勾选 GUI 安全确认。
+- 串口异常、读数异常、运动异常时：先硬件急停，再检查 USB/供电/接线。
+
+完整逐步操作在：
+
+[lift_testbench.md](<./docs/lift_testbench.md>)
+
+## 8. 开环角度测试的限制
+
+`lift_06_open_loop_angle.py` 不是闭环定位：
+
+1. 从 `03` 加载端点 JSON；
+2. 从 `04` 加载同方向、同载荷条件下的速度 JSON；
+3. 根据目标角、当前电机位移、线性标定和固定速度计算一次运行时长；
+4. 固定 rpm 运行；
+5. 停止后才读取俯仰角并计算误差。
+
+它不会在运动中根据俯仰角修正。
+
+使用 `06` 前，必须恢复与 `03` 相同的电机零点和机械参考位置；否则位移参考不一致，开环结果无效。程序拒绝超过 `2 s` 的单次开环运动，首次只验证小角度、小行程。
+
+## 9. 已完成与未完成验证
+
+已完成：
+
+- 所有 `MPC_fixed` 文件语法编译通过；
+- `mpc_controller.py` 离线自检通过；
+- 无硬件仿真闭环数值收敛；
+- 举升测试程序的安全默认值离线检查通过。
+
+未完成：
+
+- 未连接真实 COM 口；
+- 未测试 `0x3308 / 0x4202 / 0xF010` 是否与新样机一致；
+- 未验证实际正负方向、实际最大行程、速度、最小进给或开环精度；
+- 未验证 GUI 在目标设备屏幕上的显示与实际 USB 驱动兼容性。
+
+## 10. 当前 Git 状态
+
+当前改动尚未提交、尚未推送。新电脑必须直接复制整个项目目录，尤其是未跟踪的新测试文件和文档。
+
+不要提交：
+
+```text
+.venv/
+__pycache__/
+*.csv
+*.log
+实验生成的 *.json
+```
+
+如果后续继续开发，应优先阅读：
+
+- `AGENTS.md`
+- `docs/lift_testbench.md`
+- `docs/control_principle.md`
+- `MPC_fixed/master_controller.py`
+- `MPC_fixed/lift_executor.py`
+- `MPC_fixed/lift_test_common.py`

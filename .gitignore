@@ -1,0 +1,30 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+.venv/
+venv/
+env/
+.env
+
+.vscode/
+.idea/
+
+*.log
+*.csv
+*.tmp
+*.bak
+
+*.rar
+*.zip
+*.7z
+
+dist/
+build/
+*.egg-info/
+
+# 厂商 PDF 手册（体积大，不入库）
+*.pdf
+
+# Claude Code 本地配置
+.claude/
